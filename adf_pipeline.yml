@@ -1,0 +1,295 @@
+trigger:
+  branches:
+    include:
+    - feature/*
+    - release/*
+    - main
+  paths:
+    include:
+    - azuredatafactory
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+#If it is a net new pipeline and a developer is only deploying 
+# to test in dev, then pass defaults to higher level environments
+
+variables:
+- group: ADFConfig #this is here (copy+paste): https://dev.azure.com/PresidioDev/Analytics/_library?itemType=VariableGroups&view=VariableGroupView&variableGroupId=36&path=ADFConfig
+- name: workingDir
+  value: $(Build.Repository.LocalPath)/azuredatafactory/src
+- name: serviceConnection #one for each ADF
+  value: 'presidio-dev-rg-data'
+- name: dataFactoryResourceId
+  #subscriptionId: '7eaebd09-be5f-467d-be7d-5a763f0043e6'
+  #dataFactoryName: 'CorpIT-Dev-DF01'
+  #resourceGroupName: 'presidio-dev-rg-data'
+  value: /subscriptions/$(ADFConfig.subscriptionId.DEV)/resourceGroups/$(ADFConfig.resourceGroupName.DEV)/providers/Microsoft.DataFactory/factories/$(ADFConfig.dataFactoryName.DEV)
+- name: ArmDirectory
+  value: '$(Pipeline.Workspace)\datafactory\ARMTemplateForFactory.json'
+
+stages:
+- stage: build
+  jobs:
+  - job: Build_ADF_Arm_Template
+    displayName: 'Build ADF - ARM Templates'
+    workspace:
+      clean: all
+
+    steps:
+
+    - checkout: self
+      displayName: 'Checkout ADF Repo'
+      clean: true
+
+    # configuring node
+    # Installs Node and the npm packages saved in your package.json file in the build
+    # In order to leverage a Node Package Manager (npm) it would make sense to have node installed on the agent. 
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '14.x'
+      displayName: 'Install Node.js'
+
+    # Now that node is installed it's time to install npm so we can execute our package. 
+    - task: Npm@1
+      inputs:
+        command: 'install'
+        verbose: true
+        workingDir: '$(workingDir)'
+      displayName: 'Install npm package'
+
+    # validating artifacts
+    - task: Npm@1
+      inputs:
+        command: 'custom'
+        customCommand: 'run build validate $(workingDir) $(dataFactoryResourceId)'
+        workingDir: '$(workingDir)'
+      displayName: 'Validate Source Code'
+
+    # generating ARM Templates from source code
+    # This is where the "magic" happens, and the creation of our ARM template will occur. 
+    # The nuance here is the requirement of the package to have the resource ID of a data factory. 
+    # If adhering to a true CI/CD lifecycle what is in the deployed DEV instance if we want to deploy to future environments. 
+    - task: Npm@1
+      inputs:
+        command: 'custom'
+        customCommand: 'run build export $(workingDir) $(dataFactoryResourceId) "ArmTemplate"'
+        workingDir: '$(workingDir)'
+      displayName: 'Generate ARM template'
+
+    # This task will now take the output from the npm package execution as well code in the repository and create a pipeline artifact. This is key as this artifact is what we will use for our deployment stages. 
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(workingDir)/ArmTemplate'
+        artifact: 'dataFactory'
+        publishLocation: 'pipeline'
+
+    - task: PowerShell@2
+      displayName: Set Tag
+      inputs:
+        targetType: inline
+        pwsh: true
+        script: |
+          $newTag = "prod"
+          $command = "##vso[build.addbuildtag]$newTag"
+          Write-Host $command
+
+    # Looking back on these tasks I want to emphasize something. These tasks are 100% agnostic of Data Factory. 
+    # That means we’ve just created tasks that can be reused from JavaScript builds which leverage npm all the way to infrastructure deployments that will need the publish pipeline artifact task. 
+- stage: development
+  displayName: 'Development deploy'
+  dependsOn: build
+  variables:
+  - group: ADFConfig
+  #dataFactoryName: CorpIT-Dev-DF01    
+  jobs:
+  - deployment: 'Deploy_To_Development'
+    pool:
+      vmImage: 'windows-latest'
+    environment: AdfDEV
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2 #downloading artifacts created in build stage
+            inputs:
+              artifactName: 'dataFactory'
+              targetPath: '$(workingDir)/ArmTemplate'
+          - task: AzureResourceManagerTemplateDeployment@3
+            displayName: 'Creating DEV ADF ARM Templates'
+            inputs:
+              deploymentScope: 'Resource Group'
+              azureResourceManagerConnection: '$(serviceConnection)'
+              subscriptionId: '$(ADFConfig.subscriptionId.DEV)'
+              action: 'Create Or Update Resource Group'
+              resourceGroupName: $(ADFConfig.resourceGroupName.DEV)
+              location: 'East US 2'
+              templateLocation: 'Linked artifact'
+              csmFile: '$(ArmDirectory)'
+              overrideParameters: >
+                -factoryName $(ADFConfig.dataFactoryName.DEV) -presidioAdfVault_properties_typeProperties_baseUrl $(ADFConfig.AdfKvUrl.DEV) -WC_Storage_Account_connectionString $(ADFConfig.WCStorageAccount_connectionString.DEV) -default_properties_RunAnalysisServicesFlag_value $(ADFConfig.default_properties_RunAnalysisServicesFlag_value.DEV) -DataLake_accountKey $(ADFConfig.subscriptionId.DEV) -DataLake_properties_typeProperties_url $(ADFConfig.WCStorageAccount_connectionString.DEV)
+              deploymentOutputs: 'ArmOutputs'
+
+- stage: uat
+  displayName: 'UAT Deploy'
+  dependsOn: development
+  variables:
+  - group: ADFConfig
+  #dataFactoryName: CorpIT-UAT-DF01
+  #AdfKvUrl: 'https://presidio-adf-uat-vault.vault.azure.net/'
+  jobs:
+  - deployment: 'Deploy_To_UAT'
+    pool:
+      vmImage: 'windows-latest'
+    environment: AdfUAT
+    strategy:
+      runOnce:
+        preDeploy:
+          steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2 #downloading artifacts created in build stage
+            inputs:
+              source: 'current'
+              path: '$(Pipeline.Workspace)'
+          - task: AzurePowerShell@5
+            displayName: Stop ADF Triggers
+            inputs:
+              scriptType: 'FilePath'
+              ConnectedServiceNameARM: 'presidio-uat-rg-data'
+              scriptPath: $(workingDir)/PrePostDeploymentScript.ps1
+              ScriptArguments: -armTemplate $(ArmDirectory) -ResourceGroupName $(ADFConfig.resourceGroupName.UAT) -DataFactoryName $(ADFConfig.dataFactoryName.UAT) -predeployment $true -deleteDeployment $false
+              errorActionPreference: stop
+              FailOnStandardError: False
+              azurePowerShellVersion: LatestVersion
+              preferredAzurePowerShellVersion: 3.1.0
+              pwsh: False
+              workingDirectory: $(workingDir)
+          - task: AzureResourceManagerTemplateDeployment@3
+            displayName: 'Creating UAT ADF ARM Templates'
+            inputs:
+              deploymentScope: 'Resource Group'
+              azureResourceManagerConnection: $(ADFConfig.resourceGroupName.UAT)
+              subscriptionId: '$(ADFConfig.subscriptionId.UAT)'
+              action: 'Create Or Update Resource Group'
+              resourceGroupName: $(ADFConfig.resourceGroupName.UAT)
+              location: 'East US 2'
+              templateLocation: 'Linked artifact'
+              csmFile: '$(ArmDirectory)'
+              overrideParameters: >
+                -factoryName $(ADFConfig.dataFactoryName.UAT) -presidioAdfVault_properties_typeProperties_baseUrl $(ADFConfig.AdfKvUrl.UAT) -DataWarehouse_connectionString $(ADFConfig.DataWarehouse_connectionString.UAT) -CiscoInstallBase_connectionString $(ADFConfig.CiscoInstallBase_connectionString.UAT) -OneStreamDb_connectionString $(ADFConfig.OneStreamDb_connectionString.UAT) -myOrdersDb_connectionString $(ADFConfig.myOrdersDb_connectionString.UAT) -WC_Storage_Account_connectionString $(ADFConfig.WCStorageAccount_connectionString.UAT) -default_properties_SubscriptionId_value $(ADFConfig.subscriptionId.UAT) -default_properties_ResourceGroup_value $(ADFConfig.resourceGroupName.UAT) -D365BYOD_connectionString $(ADFConfig.D365BYOD_connectionString.UAT) -default_properties_RunAnalysisServicesFlag_value $(ADFConfig.default_properties_RunAnalysisServicesFlag_value.UAT) -DataLake_accountKey $(ADFConfig.subscriptionId.UAT) -DataLake_properties_typeProperties_url $(ADFConfig.WCStorageAccount_connectionString.UAT)
+              deploymentMode: 'Incremental'
+              deploymentOutputs: 'ArmOutputs'
+
+        deploy:
+          steps:
+          - task: AzureResourceManagerTemplateDeployment@3
+            displayName: 'Deploying UAT ADF ARM Templates'
+            inputs:
+              deploymentScope: 'Resource Group'
+              azureResourceManagerConnection: $(ADFConfig.resourceGroupName.UAT)
+              subscriptionId: '$(ADFConfig.subscriptionId.UAT)'
+              action: 'Create Or Update Resource Group'
+              resourceGroupName: $(ADFConfig.resourceGroupName.UAT)
+              location: 'East US 2'
+              templateLocation: 'Linked artifact'
+              csmFile: '$(ArmDirectory)'
+              csmParametersFile: '$(Pipeline.Workspace)\datafactory\ARMTemplateParametersForFactory.json'
+              overrideParameters: >
+                -factoryName $(ADFConfig.dataFactoryName.UAT) -presidioAdfVault_properties_typeProperties_baseUrl $(ADFConfig.AdfKvUrl.UAT) -DataWarehouse_connectionString $(ADFConfig.DataWarehouse_connectionString.UAT) -CiscoInstallBase_connectionString $(ADFConfig.CiscoInstallBase_connectionString.UAT) -OneStreamDb_connectionString $(ADFConfig.OneStreamDb_connectionString.UAT) -myOrdersDb_connectionString $(ADFConfig.myOrdersDb_connectionString.UAT) -WC_Storage_Account_connectionString $(ADFConfig.WCStorageAccount_connectionString.UAT) -default_properties_SubscriptionId_value $(ADFConfig.subscriptionId.UAT) -default_properties_ResourceGroup_value $(ADFConfig.resourceGroupName.UAT) -D365BYOD_connectionString $(ADFConfig.D365BYOD_connectionString.UAT) -default_properties_RunAnalysisServicesFlag_value $(ADFConfig.default_properties_RunAnalysisServicesFlag_value.UAT) -DataLake_accountKey $(ADFConfig.subscriptionId.UAT) -DataLake_properties_typeProperties_url $(ADFConfig.WCStorageAccount_connectionString.UAT)
+              deploymentMode: 'Incremental'
+          - checkout: self
+          - task: AzurePowerShell@5
+            displayName: Start ADF Triggers
+            inputs:
+              scriptType: 'FilePath'
+              ConnectedServiceNameARM: 'presidio-uat-rg-data'
+              scriptPath: $(Build.SourcesDirectory)/azuredatafactory/src/PrePostDeploymentScript.ps1
+              ScriptArguments: -armTemplate $(ArmDirectory) -ResourceGroupName $(ADFConfig.resourceGroupName.UAT) -DataFactoryName $(ADFConfig.dataFactoryName.UAT) -predeployment $false -deleteDeployment $true
+              errorActionPreference: stop
+              FailOnStandardError: False
+              azurePowerShellVersion: LatestVersion
+              preferredAzurePowerShellVersion: 3.1.0
+              pwsh: False
+              workingDirectory: $(workingDir)
+
+- stage: production
+  displayName: 'PROD Deploy'
+  dependsOn: uat
+  variables:
+  - group: ADFConfig
+  #dataFactoryName: CorpIT-UAT-DF01
+  #AdfKvUrl: 'https://presidio-adf-uat-vault.vault.azure.net/'
+  jobs:
+  - deployment: 'Deploy_To_PROD'
+    pool:
+      vmImage: 'windows-latest'
+    environment: AdfPRD
+    strategy:
+      runOnce:
+        preDeploy:
+          steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2 #downloading artifacts created in build stage
+            inputs:
+              source: 'current'
+              path: '$(Pipeline.Workspace)'
+          - task: AzurePowerShell@5
+            displayName: Stop ADF Triggers
+            inputs:
+              scriptType: 'FilePath'
+              ConnectedServiceNameARM: 'presidio-prod-rg-data'
+              scriptPath: $(workingDir)/PrePostDeploymentScript.ps1
+              ScriptArguments: -armTemplate $(ArmDirectory) -ResourceGroupName $(ADFConfig.resourceGroupName.PRD) -DataFactoryName $(ADFConfig.dataFactoryName.PRD) -predeployment $true -deleteDeployment $false
+              errorActionPreference: stop
+              FailOnStandardError: False
+              azurePowerShellVersion: LatestVersion
+              preferredAzurePowerShellVersion: 3.1.0
+              pwsh: False
+              workingDirectory: $(workingDir)
+          - task: AzureResourceManagerTemplateDeployment@3
+            displayName: 'Creating PRD ADF ARM Templates'
+            inputs:
+              deploymentScope: 'Resource Group'
+              azureResourceManagerConnection: $(ADFConfig.resourceGroupName.PRD)
+              subscriptionId: '$(ADFConfig.subscriptionId.PRD)'
+              action: 'Create Or Update Resource Group'
+              resourceGroupName: $(ADFConfig.resourceGroupName.PRD)
+              location: 'East US 2'
+              templateLocation: 'Linked artifact'
+              csmFile: '$(ArmDirectory)'
+              overrideParameters: >
+                -factoryName $(ADFConfig.dataFactoryName.PRD) -presidioAdfVault_properties_typeProperties_baseUrl $(ADFConfig.AdfKvUrl.PRD) -DataWarehouse_connectionString $(ADFConfig.DataWarehouse_connectionString.PRD) -CiscoInstallBase_connectionString $(ADFConfig.CiscoInstallBase_connectionString.PRD) -OneStreamDb_connectionString $(ADFConfig.OneStreamDb_connectionString.PRD) -myOrdersDb_connectionString $(ADFConfig.myOrdersDb_connectionString.PRD) -WC_Storage_Account_connectionString $(ADFConfig.WCStorageAccount_connectionString.PRD) -default_properties_SubscriptionId_value $(ADFConfig.subscriptionId.PRD) -default_properties_ResourceGroup_value $(ADFConfig.resourceGroupName.PRD) -D365BYOD_connectionString $(ADFConfig.D365BYOD_connectionString.PRD) -default_properties_RunAnalysisServicesFlag_value $(ADFConfig.default_properties_RunAnalysisServicesFlag_value.PRD) -DataLake_accountKey $(ADFConfig.subscriptionId.PRD) -DataLake_properties_typeProperties_url $(ADFConfig.WCStorageAccount_connectionString.PRD)
+              deploymentMode: 'Incremental'
+              deploymentOutputs: 'ArmOutputs'
+
+        deploy:
+          steps:
+          - task: AzureResourceManagerTemplateDeployment@3
+            displayName: 'Deploying PRD ADF ARM Templates'
+            inputs:
+              deploymentScope: 'Resource Group'
+              azureResourceManagerConnection: $(ADFConfig.resourceGroupName.PRD)
+              subscriptionId: '$(ADFConfig.subscriptionId.PRD)'
+              action: 'Create Or Update Resource Group'
+              resourceGroupName: $(ADFConfig.resourceGroupName.PRD)
+              location: 'East US 2'
+              templateLocation: 'Linked artifact'
+              csmFile: '$(ArmDirectory)'
+              csmParametersFile: '$(Pipeline.Workspace)\datafactory\ARMTemplateParametersForFactory.json'
+              overrideParameters: >
+                -factoryName $(ADFConfig.dataFactoryName.PRD) -presidioAdfVault_properties_typeProperties_baseUrl $(ADFConfig.AdfKvUrl.PRD) -DataWarehouse_connectionString $(ADFConfig.DataWarehouse_connectionString.PRD) -CiscoInstallBase_connectionString $(ADFConfig.CiscoInstallBase_connectionString.PRD) -OneStreamDb_connectionString $(ADFConfig.OneStreamDb_connectionString.PRD) -myOrdersDb_connectionString $(ADFConfig.myOrdersDb_connectionString.PRD) -WC_Storage_Account_connectionString $(ADFConfig.WCStorageAccount_connectionString.PRD) -default_properties_SubscriptionId_value $(ADFConfig.subscriptionId.PRD) -default_properties_ResourceGroup_value $(ADFConfig.resourceGroupName.PRD) -D365BYOD_connectionString $(ADFConfig.D365BYOD_connectionString.PRD) -default_properties_RunAnalysisServicesFlag_value $(ADFConfig.default_properties_RunAnalysisServicesFlag_value.PRD) -DataLake_accountKey $(ADFConfig.subscriptionId.PRD) -DataLake_properties_typeProperties_url $(ADFConfig.WCStorageAccount_connectionString.PRD)
+              deploymentMode: 'Incremental'
+          - checkout: self
+          - task: AzurePowerShell@5
+            displayName: Start ADF Triggers
+            inputs:
+              scriptType: 'FilePath'
+              ConnectedServiceNameARM: 'presidio-prod-rg-data'
+              scriptPath: $(Build.SourcesDirectory)/azuredatafactory/src/PrePostDeploymentScript.ps1
+              ScriptArguments: -armTemplate $(ArmDirectory) -ResourceGroupName $(ADFConfig.resourceGroupName.PRD) -DataFactoryName $(ADFConfig.dataFactoryName.PRD) -predeployment $false -deleteDeployment $true
+              errorActionPreference: stop
+              FailOnStandardError: False
+              azurePowerShellVersion: LatestVersion
+              preferredAzurePowerShellVersion: 3.1.0
+              pwsh: False
+              workingDirectory: $(workingDir)
